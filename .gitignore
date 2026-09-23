@@ -1,0 +1,10 @@
+build/
+*.o
+*.d
+*.so
+*.log
+!soak/*.log
+__pycache__/
+.venv/
+*.pyc
+data/
