@@ -2,19 +2,15 @@
 
 ## The user
 A renter in an older apartment with a windowless bathroom. Black
-mold spots keep returning to the ceiling corner above the shower. The
-landlord blames tenant behavior ("you don't run the fan"); the tenant
+mold spots keep returning to the ceiling corner above the shower. the tenant
 believes the exhaust fan barely works. Neither side has any data. The
 device sits on a bathroom shelf with nothing attached to the walls or
 ceiling, so it can be set up and removed without touching the rental.
 
 ## The problem
-The spots return within 2-3 weeks of every cleaning. Each cleaning
-costs an hour and a bottle of bleach spray, the tenant worries about
-breathing it, and a mold finding at move-out can cost part or all of a
-security deposit. The dispute with the landlord cannot be settled
-because nobody knows how long the ceiling actually stays wet after a
-shower, or whether the fan changes that.
+Mold can build up fast in a bathroom where humid showers take place, and
+It can be virtually impossible to tell there's actual mold. maybe some spots
+pop up randomly and you clean it and it comes back.
 
 ## Why a device
 Mold does not grow during the shower; it grows in the hours afterward,
@@ -31,32 +27,22 @@ weeks, through every shower, unattended.
   aimed at the ceiling corner, measuring its surface temperature from
   a distance.
 
-They cooperate by fusion: surface relative humidity is computed from
-the room's dew point *and* the ceiling's temperature. A cold ceiling
-can sit near 100% surface humidity while the room reads a harmless
-65%, so neither sensor alone can say whether mold conditions exist.
-From this fused signal we derive (1) daily "wet hours" at the surface,
-(2) shower events via a state machine, and (3) post-shower drying time,
-whose trend over weeks reveals whether ventilation is working or
-degrading.
+surface relative humidity is computed from the room's dew point and the ceiling's temperature.
+with this we can determine whether stuff is natural or not.
+(1) daily "wet hours" at the surface,
+(2) shower events via a state machine
+(3) post-shower drying time
 
 ## The mechanisms
-- **D, crash-consistent append-only log:** weeks of wetness history are
-  the product itself, and a bathroom outlet losing power mid-write must
+- weeks of wetness history are
+  the product itself and a bathroom outlet 
+  losing power mid-write must
   not corrupt or erase them.
-- **E, multi-process with supervisor:** a sensor that fails or gets
-  knocked loose must not take the device down, so each sensor runs in
-  its own process, and a supervisor detects the loss, keeps the other
-  sensor running, logs the degradation, and recovers when it returns.
+- a sensor that fails or gets knocked loose must not take the device down,
+  so each sensor runs in
+  its own process.
 
 ## The risk
-We cannot observe actual mold growth within a semester, so we cannot
-validate "detects mold." We narrow the claim to "measures mold-risk
-conditions and ventilation effectiveness," and build our own ground
-truth: deliberate showers with the fan on versus off, plus a one-week
-paper log of real showers to check the shower detector's true- and
-false-positive rates. A second risk is infrared accuracy: the
-MLX90614 reads a spot, not a point, and steam between the sensor and
-the ceiling may skew readings, so we will check it against a contact
-thermometer held on the ceiling. Condensation on the electronics is
-handled by placing the device away from the shower spray.
+We cannot observe actual mold growth within a semester, and that
+would be far too risky, however, we can sample test data
+that may be similar to prove this
