@@ -81,3 +81,22 @@ $(BUILD)/test_store_bootid: tests/test_store_bootid.c $(STORE_LIB) $(STORE_HDR) 
 test: test-store-bootid
 test-store-bootid: $(BUILD)/test_store_bootid
 	./$(BUILD)/test_store_bootid
+
+.PHONY: test-store-append memcheck-store
+
+$(BUILD)/test_store_append: tests/test_store_append.c $(STORE_LIB) $(STORE_HDR) src/capture/log.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc/store -Isrc/capture $(CFLAGS) -o $@ tests/test_store_append.c $(STORE_LIB)
+
+test: test-store-append
+test-store-append: $(BUILD)/test_store_append
+	./$(BUILD)/test_store_append
+
+# Every store test under valgrind; runs as part of `make memcheck`.
+memcheck: memcheck-store
+memcheck-store: $(BUILD)/test_store_crc $(BUILD)/test_store_header $(BUILD)/test_store_bootid \
+                $(BUILD)/test_store_append
+	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/test_store_crc
+	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/test_store_header
+	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/test_store_bootid
+	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/test_store_append

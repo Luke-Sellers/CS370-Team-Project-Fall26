@@ -1,8 +1,8 @@
 /* store.c -- per-sensor segment log; format and rules in docs/store-plan.md.
  *
  * This file currently covers open/close, the per-sensor lock, segment naming
- * and creation, the header check, and the per-boot segment rule. Appending,
- * rotation and tail recovery come in later steps.
+ * and creation, the header check, the per-boot segment rule, and appending
+ * with rollback and rotation. Tail recovery comes in a later step.
  */
 #define _DEFAULT_SOURCE /* flock(2); -D_POSIX_C_SOURCE alone hides it */
 
@@ -36,6 +36,8 @@ struct store {
     uint32_t counter;     /* live segment */
     uint32_t max_any;     /* highest counter seen, live or quarantined */
     uint64_t records;     /* records in the live segment */
+    off_t size;           /* live segment's size after the last good append */
+    int failed;           /* an append failed: refuse all further appends */
     uint8_t boot_id[16];  /* this boot; zeros if unknown */
 };
 
@@ -360,6 +362,7 @@ static int create_segment(struct store *st, uint32_t counter)
     fd = -1;
     st->counter = counter;
     st->records = 0;
+    st->size = (off_t)sizeof h;
     if (counter > st->max_any)
         st->max_any = counter;
     log_msg("created %s", seg);
@@ -488,16 +491,23 @@ int store_open(const char *dir, enum sensor_id sensor, struct store **out,
         rc = STORE_EIO;
 
         if (boot_known(st->boot_id) && memcmp(h.boot_id, st->boot_id, 16) == 0) {
-            /* Same boot: keep appending here. The record count trusts the
-             * file size until tail recovery (step 4) checks the records. */
-            st->fd = fd;
-            fd = -1;
-            st->counter = max_live;
-            st->records = (uint64_t)(sb.st_size - (off_t)sizeof h) / sizeof(struct record);
-            goto done;
+            /* Same boot: keep appending here unless it is full. The record
+             * count trusts the file size until tail recovery (step 4)
+             * checks the records. */
+            uint64_t n = (uint64_t)(sb.st_size - (off_t)sizeof h) / sizeof(struct record);
+            if (n < STORE_SEG_MAX) {
+                st->fd = fd;
+                fd = -1;
+                st->counter = max_live;
+                st->records = n;
+                st->size = sb.st_size;
+                goto done;
+            }
+            log_msg("%s is full (%" PRIu64 " records); starting the next segment", name, n);
+        } else {
+            /* Another boot: that segment stays sealed as it is. */
+            info->new_boot = 1;
         }
-        /* Another boot: that segment stays sealed as it is. */
-        info->new_boot = 1;
         if (close(fd) < 0) {
             fd = -1;
             fail(0, "close", name);
@@ -527,6 +537,94 @@ out:
     release(st);
     errno = e;
     return rc;
+}
+
+/* Start counter+1 because the live segment is full. The new segment is
+ * complete and durable before the old fd is let go; on failure the handle
+ * still points at the old, untouched segment. */
+static int rotate(struct store *st)
+{
+    int old = st->fd;
+    uint32_t next;
+    int rc;
+
+    rc = next_counter(st, &next);
+    if (rc != STORE_OK)
+        return rc;
+    rc = create_segment(st, next); /* replaces st->fd only on success */
+    if (rc != STORE_OK)
+        return rc;
+    if (close(old) < 0)
+        fail(0, "close", "full segment"); /* already fdatasync'd: log, carry on */
+    log_msg("rotated to segment %06" PRIu32, next);
+    return STORE_OK;
+}
+
+int store_append(struct store *st, const struct record *r)
+{
+    struct record rec;
+    ssize_t w;
+
+    if (st == NULL || r == NULL) {
+        errno = EINVAL;
+        return STORE_EINVAL;
+    }
+    if (r->magic != RECORD_MAGIC || r->sensor != (uint8_t)st->sensor || r->reserved != 0) {
+        log_msg("refusing record #%" PRIu32 ": magic=0x%04x sensor=%u reserved=%" PRIu32,
+                r->seq, (unsigned)r->magic, (unsigned)r->sensor, r->reserved);
+        errno = EINVAL;
+        return STORE_EINVAL;
+    }
+    if (st->failed) {
+        errno = EIO;
+        return STORE_EIO;
+    }
+    if (st->records >= STORE_SEG_MAX && rotate(st) != STORE_OK) {
+        st->failed = 1;
+        return STORE_EIO;
+    }
+
+    rec = *r;
+    rec.crc32 = store_crc32(&rec, offsetof(struct record, crc32));
+    do {
+        w = write(st->fd, &rec, sizeof rec);
+    } while (w < 0 && errno == EINTR);
+    if (w != (ssize_t)sizeof rec) {
+        if (w >= 0) {
+            log_msg("short write: %zd of %zu bytes", w, sizeof rec);
+            errno = EIO;
+        } else {
+            fail(0, "write", "segment");
+        }
+        goto rollback;
+    }
+    if (fdatasync(st->fd) < 0) {
+        fail(0, "fdatasync", "segment");
+        goto rollback;
+    }
+    st->records++;
+    st->size += (off_t)sizeof rec;
+    return STORE_OK;
+
+rollback:
+    /* Cut back to the last whole record so the file stays aligned. The
+     * handle is done either way: after a failed write or fsync we cannot
+     * know what the page cache holds, so the caller must close and exit. */
+    {
+        int e = errno;
+        if (ftruncate(st->fd, st->size) < 0)
+            fail(0, "rollback ftruncate", "segment");
+        else if (fdatasync(st->fd) < 0)
+            fail(0, "rollback fdatasync", "segment");
+        st->failed = 1;
+        errno = e;
+    }
+    return STORE_EIO;
+}
+
+uint32_t store_counter(const struct store *st)
+{
+    return st != NULL ? st->counter : 0;
 }
 
 int store_close(struct store *st)
