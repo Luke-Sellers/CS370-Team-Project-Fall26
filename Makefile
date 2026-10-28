@@ -43,3 +43,16 @@ soakcheck:
 
 clean:
 	rm -rf build
+
+# --- storage (src/store); see docs/store-plan.md ---
+STORE_HDR := include/record.h $(wildcard src/store/*.h)
+
+.PHONY: test-store-crc
+
+$(BUILD)/test_store_crc: tests/test_store_crc.c src/store/crc32.c $(STORE_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc/store $(CFLAGS) -o $@ tests/test_store_crc.c src/store/crc32.c
+
+test: test-store-crc
+test-store-crc: $(BUILD)/test_store_crc
+	./$(BUILD)/test_store_crc
