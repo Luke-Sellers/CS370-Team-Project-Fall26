@@ -56,3 +56,16 @@ $(BUILD)/test_store_crc: tests/test_store_crc.c src/store/crc32.c $(STORE_HDR)
 test: test-store-crc
 test-store-crc: $(BUILD)/test_store_crc
 	./$(BUILD)/test_store_crc
+
+# store.c logs through capture's log.c, compiled in unmodified.
+STORE_LIB := src/store/store.c src/store/crc32.c src/capture/log.c
+
+.PHONY: test-store-header
+
+$(BUILD)/test_store_header: tests/test_store_header.c $(STORE_LIB) $(STORE_HDR) src/capture/log.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc/store -Isrc/capture $(CFLAGS) -o $@ tests/test_store_header.c $(STORE_LIB)
+
+test: test-store-header
+test-store-header: $(BUILD)/test_store_header
+	./$(BUILD)/test_store_header
