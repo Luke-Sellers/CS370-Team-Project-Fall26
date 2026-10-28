@@ -10,7 +10,8 @@ will carry the architecture.
 
 ## Status
 
-Milestone M0/M1. Hardware ordered; no product code yet by design.
+M3 in progress. Capture runs end to end on synthetic data; the BME280
+and MLX90614 readouts are next. Storage (mechanism D) is in progress.
 
 ## Hardware
 
@@ -25,10 +26,30 @@ Wire with the board powered off; check voltages with a meter first.
 
 ## Build
 
-    make            # build everything
+    make            # build everything into build/
     make test       # unit tests
-    make asan       # sanitizer build
-    make soakcheck  # 1-hour miniature of the 48h soak
+    make asan       # build and test under AddressSanitizer + UBSan
+    make memcheck   # tests and a fake capture under valgrind
+
+## Run capture
+
+One process per sensor. Records go to stdout; the timestamped log
+(startup, heartbeats, sensor lost/recovered, shutdown) goes to stderr.
+
+    ./build/capture --sensor bme280                 # live, on the Pi
+    ./build/capture --sensor mlx90614
+    ./build/capture --sensor bme280 --binary        # raw records for storage
+
+Without hardware, `--fake` produces synthetic readings. Every fake record
+carries the REC_SYNTHETIC flag and is printed with SYNTHETIC, and the log
+says mode=SYNTHETIC. `--fake-drop START:LEN` simulates the sensor failing
+for LEN samples, to rehearse fault handling:
+
+    ./build/capture --sensor bme280 --fake --interval-ms 500 --fake-drop 10:5
+
+## Network
+
+The product makes no network calls. Nothing under src/ opens a socket.
 
 ## Layout
 

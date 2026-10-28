@@ -1,0 +1,141 @@
+/* store.h -- per-sensor, append-only segment log of struct record.
+ * Format and rules: docs/store-plan.md.
+ *
+ * On disk, in one directory:
+ *   <sensor>.lock                 held (flock) by the one writer per sensor
+ *   <sensor>.<counter>.mwlog      segment: 32-byte header, then records
+ *   <sensor>.<counter>.mwlog.corrupt-<n>   quarantined segment, bytes kept
+ * The counter is printed %06u and compared as a number. Byte order is the
+ * host's, as in record.h.
+ */
+#ifndef MOLDWATCH_STORE_H
+#define MOLDWATCH_STORE_H
+
+#include <stdint.h>
+
+#include "record.h"
+
+#define STORE_MAGIC   0x474C574Du /* "MWLG" on disk (little-endian) */
+#define STORE_VERSION 1u
+#define STORE_SEG_MAX 8640u       /* records per segment, then the next counter */
+
+/* The first 32 bytes of every segment. */
+struct store_header {
+    uint32_t magic;       /* STORE_MAGIC */
+    uint16_t version;     /* STORE_VERSION */
+    uint8_t  sensor;      /* enum sensor_id */
+    uint8_t  record_size; /* sizeof(struct record) */
+    uint32_t counter;     /* must equal the counter in the file name */
+    uint8_t  boot_id[16]; /* /proc/sys/kernel/random/boot_id; zeros if unknown */
+    uint32_t crc32;       /* store_crc32 over bytes [0, 28) */
+};
+
+_Static_assert(sizeof(struct store_header) == 32, "struct store_header must stay 32 bytes");
+
+enum store_status {
+    STORE_OK       = 0,
+    STORE_EIO      = -1, /* a syscall failed; it was logged and errno is kept */
+    STORE_EBADHDR  = -2, /* bad magic, CRC, record_size or counter, or too short */
+    STORE_EVERSION = -3, /* another format version: refused, left untouched */
+    STORE_ESENSOR  = -4, /* header is for the other sensor: refused, untouched */
+    STORE_ECORRUPT = -5, /* a record fails magic, sensor or CRC */
+    STORE_EBUSY    = -6, /* another process holds <sensor>.lock */
+    STORE_EINVAL   = -7, /* bad argument, or a record append refused */
+};
+
+struct store_open_info {
+    uint32_t counter;  /* the segment appends go to */
+    int      created;  /* 1 = this open created that segment */
+    int      new_boot; /* 1 = the latest segment belonged to another boot */
+    uint64_t records;  /* records already in that segment */
+
+    /* What recovery did to the latest segment found on disk. */
+    uint64_t truncated_bytes;     /* torn tail removed (0..63 bytes) */
+    int      quarantined;         /* 1 = renamed <seg>.corrupt-<n>, bytes kept */
+    uint32_t quarantined_counter; /* which segment was quarantined */
+    uint64_t bad_offset;          /* first bad byte that caused it; 0 = header */
+    uint32_t last_seq;            /* last valid record seen there; 0 if none */
+    int64_t  last_t_ns;
+};
+
+/* A stored record is valid when magic, sensor and crc32 all check out. */
+int store_record_check(const struct record *r, enum sensor_id sensor);
+
+/* Check a segment header read from the file for counter. Version is judged
+ * before the CRC, so a newer format is refused rather than called corrupt. */
+int store_header_check(const struct store_header *h, enum sensor_id sensor, uint32_t counter);
+
+struct store;
+
+/* Open the log for one sensor in dir, which must already exist.
+ * Takes <sensor>.lock for the life of the handle, removes this sensor's stale
+ * .tmp files, and recovers the latest segment:
+ *   - a partial record, or one bad *last* record, is a torn final write:
+ *     it is truncated away;
+ *   - a bad header, or a bad record before the last, is corruption: the
+ *     segment is renamed <seg>.corrupt-<n> with every byte kept;
+ *   - another format version or sensor is refused (error, untouched).
+ * Then it picks the segment: the latest one if it was written in this boot
+ * and holds fewer than STORE_SEG_MAX records, otherwise a new one numbered
+ * 1 + the highest counter seen, live or quarantined. On error *out is NULL.
+ * info may be NULL. */
+int store_open(const char *dir, enum sensor_id sensor, struct store **out,
+               struct store_open_info *info);
+
+/* Append one record and fdatasync it; durable when this returns STORE_OK.
+ * r is copied; storage fills crc32 over bytes [0, 28) and keeps every other
+ * bit. STORE_EINVAL (nothing written) if magic, sensor or reserved is wrong.
+ * When the live segment holds STORE_SEG_MAX records, a new segment is fully
+ * created first and the record goes there.
+ * On STORE_EIO the segment is rolled back to its last whole record and the
+ * handle refuses all further appends: the caller must close and exit, since
+ * after a failed fsync the page cache can no longer be trusted. */
+int store_append(struct store *st, const struct record *r);
+
+/* Counter of the live segment: the one opened, or the last one appended to. */
+uint32_t store_counter(const struct store *st);
+
+/* Close every fd and free. NULL is fine. STORE_EIO if a close failed. */
+int store_close(struct store *st);
+
+/* ---- Reader: for analysis. Read-only; takes no lock; never truncates or
+ * renames, so it can run while the writer appends.
+ *
+ * Opening snapshots the sensor's file list and walks it in order: counter
+ * ascending, and for one counter the live file, then .corrupt-1, .corrupt-2...
+ *   Live or sealed segment: a bad header skips it; a partial or bad *last*
+ *     record is a write in progress (or a torn one) and just ends it; a bad
+ *     record before the last stops that segment, is counted, and the walk
+ *     moves on. There is no resync past a bad record.
+ *   Quarantined file: with a valid header, its records up to the first bad or
+ *     partial one are returned (salvaged), then the walk moves on; with a bad
+ *     header nothing is salvaged. */
+struct store_reader;
+
+struct store_rec_src {
+    uint32_t counter;     /* segment the record came from */
+    uint8_t  boot_id[16]; /* that segment's boot */
+    int      quarantined; /* 1 = salvaged from a .corrupt-<n> file */
+};
+
+struct store_reader_stats {
+    uint32_t segments;          /* live or sealed files opened */
+    uint32_t quarantined_files; /* .corrupt-<n> files opened */
+    uint32_t bad_header;        /* files of either kind skipped for their header */
+    uint32_t corrupt_stops;     /* live or sealed segments cut short mid-file */
+    uint32_t vanished;          /* listed at open, gone when reached (renamed) */
+    uint64_t salvaged_records;  /* records returned from .corrupt-<n> files */
+};
+
+int store_reader_open(const char *dir, enum sensor_id sensor, struct store_reader **out);
+
+/* 1 = *out holds the next record (src may be NULL), 0 = end, STORE_EIO = a
+ * read failed (logged); after an error every call returns STORE_EIO. */
+int store_reader_next(struct store_reader *rd, struct record *out, struct store_rec_src *src);
+
+void store_reader_stats(const struct store_reader *rd, struct store_reader_stats *out);
+
+/* Close and free. NULL is fine. STORE_EIO if a close failed. */
+int store_reader_close(struct store_reader *rd);
+
+#endif
