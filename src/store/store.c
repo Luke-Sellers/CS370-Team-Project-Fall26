@@ -23,7 +23,9 @@
 #include "crc32.h"
 #include "log.h"
 
+#ifndef BOOT_ID_PATH /* tests point this at a file they control */
 #define BOOT_ID_PATH "/proc/sys/kernel/random/boot_id"
+#endif
 #define NAME_LEN     64
 
 struct store {
@@ -183,7 +185,10 @@ static void read_boot_id(uint8_t out[16])
         return;
     }
     if (fgets(text, sizeof text, f) == NULL) {
-        fail(0, "read", BOOT_ID_PATH);
+        if (ferror(f))
+            fail(0, "read", BOOT_ID_PATH);
+        else
+            log_msg("%s: empty; boot id unknown", BOOT_ID_PATH);
         goto out;
     }
     for (const char *c = text; *c != '\0' && *c != '\n'; c++) {

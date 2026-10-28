@@ -69,3 +69,15 @@ $(BUILD)/test_store_header: tests/test_store_header.c $(STORE_LIB) $(STORE_HDR) 
 test: test-store-header
 test-store-header: $(BUILD)/test_store_header
 	./$(BUILD)/test_store_header
+
+# store.c rebuilt with a boot-id path the test controls, so the unknown and
+# malformed boot-id cases actually run.
+.PHONY: test-store-bootid
+
+$(BUILD)/test_store_bootid: tests/test_store_bootid.c $(STORE_LIB) $(STORE_HDR) src/capture/log.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) -DBOOT_ID_PATH='"/tmp/mw_test_boot_id"' -Isrc/store -Isrc/capture $(CFLAGS) -o $@ tests/test_store_bootid.c $(STORE_LIB)
+
+test: test-store-bootid
+test-store-bootid: $(BUILD)/test_store_bootid
+	./$(BUILD)/test_store_bootid
