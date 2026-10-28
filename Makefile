@@ -128,3 +128,30 @@ test-store-reader: $(BUILD)/test_store_reader
 memcheck: memcheck-store-reader
 memcheck-store-reader: $(BUILD)/test_store_reader
 	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/test_store_reader
+
+# The store daemon: capture --binary | store --sensor S --dir D
+.PHONY: test-stored memcheck-stored
+
+all: $(BUILD)/store
+
+$(BUILD)/store: src/store/stored.c $(STORE_LIB) $(STORE_HDR) src/capture/log.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc/store -Isrc/capture $(CFLAGS) -o $@ src/store/stored.c $(STORE_LIB)
+
+$(BUILD)/test_stored: tests/test_stored.c $(STORE_LIB) $(STORE_HDR) src/capture/log.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc/store -Isrc/capture $(CFLAGS) -o $@ tests/test_stored.c $(STORE_LIB)
+
+# Spawns the capture and store binaries from this same build dir.
+test: test-stored
+test-stored: $(BUILD)/test_stored $(BUILD)/store $(BUILD)/capture
+	./$(BUILD)/test_stored $(BUILD)
+
+# The test itself, then the daemon under valgrind in a real fake pipeline.
+memcheck: memcheck-stored
+memcheck-stored: $(BUILD)/test_stored $(BUILD)/store $(BUILD)/capture
+	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/test_stored $(BUILD)
+	d=$$(mktemp -d) && \
+	./$(BUILD)/capture --sensor bme280 --fake --binary --interval-ms 1 --count 50 2>/dev/null | \
+	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/store --sensor bme280 --dir $$d; \
+	rc=$$?; rm -rf $$d; exit $$rc
