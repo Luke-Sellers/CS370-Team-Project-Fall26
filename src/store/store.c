@@ -1,8 +1,9 @@
 /* store.c -- per-sensor segment log; format and rules in docs/store-plan.md.
  *
- * This file currently covers open/close, the per-sensor lock, segment naming
- * and creation, the header check, the per-boot segment rule, and appending
- * with rollback and rotation. Tail recovery comes in a later step.
+ * This file covers open/close, the per-sensor lock, segment naming and
+ * creation, the header check, recovery of the latest segment (torn tail
+ * truncated, corruption quarantined), the per-boot segment rule, and
+ * appending with rollback and rotation.
  */
 #define _DEFAULT_SOURCE /* flock(2); -D_POSIX_C_SOURCE alone hides it */
 
@@ -162,6 +163,15 @@ int store_header_check(const struct store_header *h, enum sensor_id sensor, uint
         return STORE_ESENSOR;
     if (h->counter != counter)
         return STORE_EBADHDR;
+    return STORE_OK;
+}
+
+int store_record_check(const struct record *r, enum sensor_id sensor)
+{
+    if (r->magic != RECORD_MAGIC || r->sensor != (uint8_t)sensor)
+        return STORE_ECORRUPT;
+    if (r->crc32 != store_crc32(r, offsetof(struct record, crc32)))
+        return STORE_ECORRUPT;
     return STORE_OK;
 }
 
@@ -387,6 +397,179 @@ static int next_counter(const struct store *st, uint32_t *out)
     return STORE_OK;
 }
 
+/* Check the n whole records after the header, in 4 KiB reads. With an
+ * fdatasync after every append, at most one write is ever in flight, so the
+ * only damage a crash can leave is a partial record or one bad *last* record.
+ * STORE_OK: *keep is n, or n-1 when only the last record is bad.
+ * STORE_ECORRUPT: an earlier record is bad; *keep is its index.
+ * *last is the last valid record before *keep (zeroed if none). */
+static int scan_records(int fd, enum sensor_id sensor, uint64_t n, uint64_t *keep,
+                        struct record *last)
+{
+    struct record buf[128];
+    uint64_t i = 0;
+
+    memset(last, 0, sizeof *last);
+    while (i < n) {
+        size_t k = (n - i < 128) ? (size_t)(n - i) : 128;
+        off_t off = (off_t)(sizeof(struct store_header) + i * sizeof(struct record));
+        if (pread_all(fd, buf, k * sizeof buf[0], off) < 0)
+            return STORE_EIO;
+        for (size_t j = 0; j < k; j++, i++) {
+            if (store_record_check(&buf[j], sensor) != STORE_OK) {
+                *keep = i;
+                return i == n - 1 ? STORE_OK : STORE_ECORRUPT;
+            }
+            *last = buf[j];
+        }
+    }
+    *keep = n;
+    return STORE_OK;
+}
+
+/* Rename segment `counter` to <seg>.corrupt-<k>, the smallest free k, and
+ * make the rename durable. Every byte is kept; nothing is truncated. The
+ * per-sensor lock makes check-then-rename race-free. */
+static int quarantine(struct store *st, uint32_t counter, const char *why, uint64_t off)
+{
+    char seg[NAME_LEN], dst[NAME_LEN + 32];
+    struct stat sb;
+
+    if (seg_name(seg, sizeof seg, st->sensor, counter, "") < 0)
+        return fail(STORE_EIO, "name", sensor_name(st->sensor));
+    for (unsigned k = 1; k <= 1000; k++) {
+        snprintf(dst, sizeof dst, "%s.corrupt-%u", seg, k);
+        if (fstatat(st->dirfd, dst, &sb, AT_SYMLINK_NOFOLLOW) == 0)
+            continue;
+        if (errno != ENOENT)
+            return fail(STORE_EIO, "stat", dst);
+        if (renameat(st->dirfd, seg, st->dirfd, dst) < 0)
+            return fail(STORE_EIO, "rename", seg);
+        if (fsync(st->dirfd) < 0)
+            return fail(STORE_EIO, "fsync dir for", dst);
+        log_msg("QUARANTINED %s as %s: %s at offset %" PRIu64 "; every byte kept",
+                seg, dst, why, off);
+        return STORE_OK;
+    }
+    errno = EEXIST;
+    return fail(STORE_EIO, "no free quarantine name for", seg);
+}
+
+/* Recover the latest segment, `counter`. Torn tail: truncated. Bad header or
+ * a bad record before the last: quarantined. Another version or sensor:
+ * refused, untouched. Sets *reuse when appends should continue in it (this
+ * boot, not full); otherwise the caller starts a new segment. */
+static int recover_latest(struct store *st, uint32_t counter, struct store_open_info *info,
+                          int *reuse)
+{
+    char name[NAME_LEN];
+    struct store_header h;
+    struct record last;
+    struct stat sb;
+    uint64_t n, keep = 0, bad = 0;
+    off_t keep_size;
+    const char *why;
+    int fd = -1, rc = STORE_EIO, e;
+
+    *reuse = 0;
+    if (seg_name(name, sizeof name, st->sensor, counter, "") < 0)
+        return fail(STORE_EIO, "name", sensor_name(st->sensor));
+    fd = openat(st->dirfd, name, O_RDWR | O_APPEND | O_CLOEXEC);
+    if (fd < 0)
+        return fail(STORE_EIO, "open", name);
+    if (fstat(fd, &sb) < 0) {
+        fail(0, "fstat", name);
+        goto out;
+    }
+
+    if (sb.st_size < (off_t)sizeof h) {
+        why = "shorter than a header";
+        goto corrupt;
+    }
+    if (pread_all(fd, &h, sizeof h, 0) < 0) {
+        fail(0, "read header", name);
+        goto out;
+    }
+    rc = store_header_check(&h, st->sensor, counter);
+    if (rc == STORE_EVERSION || rc == STORE_ESENSOR) {
+        log_msg("refusing %s: %s", name, status_text(rc));
+        goto out;
+    }
+    if (rc == STORE_EBADHDR) {
+        why = "bad header";
+        goto corrupt;
+    }
+    rc = STORE_EIO;
+
+    n = (uint64_t)(sb.st_size - (off_t)sizeof h) / sizeof(struct record);
+    rc = scan_records(fd, st->sensor, n, &keep, &last);
+    info->last_seq = last.seq;
+    info->last_t_ns = last.t_ns;
+    if (rc == STORE_EIO) {
+        fail(0, "read records", name);
+        goto out;
+    }
+    if (rc == STORE_ECORRUPT) {
+        why = "bad record";
+        bad = sizeof h + keep * sizeof(struct record);
+        goto corrupt;
+    }
+    rc = STORE_EIO;
+
+    keep_size = (off_t)(sizeof h + keep * sizeof(struct record));
+    if (keep_size != sb.st_size) {
+        if (ftruncate(fd, keep_size) < 0) {
+            fail(0, "truncate torn tail of", name);
+            goto out;
+        }
+        if (fdatasync(fd) < 0) {
+            fail(0, "fdatasync after truncating", name);
+            goto out;
+        }
+        info->truncated_bytes = (uint64_t)(sb.st_size - keep_size);
+        log_msg("%s: removed a torn tail of %" PRIu64 " bytes; %" PRIu64 " records kept",
+                name, info->truncated_bytes, keep);
+    }
+
+    if (boot_known(st->boot_id) && memcmp(h.boot_id, st->boot_id, 16) == 0) {
+        if (keep < STORE_SEG_MAX) {
+            st->fd = fd;
+            fd = -1;
+            st->counter = counter;
+            st->records = keep;
+            st->size = keep_size;
+            *reuse = 1;
+        } else {
+            log_msg("%s is full (%" PRIu64 " records); starting the next segment", name, keep);
+        }
+    } else {
+        info->new_boot = 1; /* that segment stays sealed as it is */
+    }
+    rc = STORE_OK;
+    goto out;
+
+corrupt:
+    if (close(fd) < 0) {
+        fd = -1;
+        rc = fail(STORE_EIO, "close", name);
+        goto out;
+    }
+    fd = -1;
+    rc = quarantine(st, counter, why, bad);
+    if (rc == STORE_OK) {
+        info->quarantined = 1;
+        info->quarantined_counter = counter;
+        info->bad_offset = bad;
+    }
+
+out:
+    e = errno;
+    if (fd >= 0 && close(fd) < 0)
+        fail(0, "close", name);
+    errno = e;
+    return rc;
+}
+
 /* Close what is open and free. Returns STORE_EIO if any close failed. */
 static int release(struct store *st)
 {
@@ -411,10 +594,8 @@ int store_open(const char *dir, enum sensor_id sensor, struct store **out,
     struct store *st = NULL;
     const char *sname = sensor_name(sensor);
     char name[NAME_LEN];
-    struct store_header h;
-    struct stat sb;
     uint32_t max_live = 0, next;
-    int have_live = 0, fd = -1, rc = STORE_EIO, e;
+    int have_live = 0, rc = STORE_EIO, e;
 
     if (out != NULL)
         *out = NULL;
@@ -460,60 +641,13 @@ int store_open(const char *dir, enum sensor_id sensor, struct store **out,
     rc = STORE_EIO;
 
     if (have_live) {
-        if (seg_name(name, sizeof name, sensor, max_live, "") < 0) {
-            fail(0, "name", sname);
+        int reuse = 0;
+        rc = recover_latest(st, max_live, info, &reuse);
+        if (rc != STORE_OK)
             goto out;
-        }
-        fd = openat(st->dirfd, name, O_RDWR | O_APPEND | O_CLOEXEC);
-        if (fd < 0) {
-            fail(0, "open", name);
-            goto out;
-        }
-        if (fstat(fd, &sb) < 0) {
-            fail(0, "fstat", name);
-            goto out;
-        }
-        if (sb.st_size < (off_t)sizeof h) {
-            rc = STORE_EBADHDR;
-            log_msg("refusing %s: %lld bytes, shorter than a header", name,
-                    (long long)sb.st_size);
-            goto out;
-        }
-        if (pread_all(fd, &h, sizeof h, 0) < 0) {
-            fail(0, "read header", name);
-            goto out;
-        }
-        rc = store_header_check(&h, sensor, max_live);
-        if (rc != STORE_OK) {
-            log_msg("refusing %s: %s", name, status_text(rc));
-            goto out;
-        }
         rc = STORE_EIO;
-
-        if (boot_known(st->boot_id) && memcmp(h.boot_id, st->boot_id, 16) == 0) {
-            /* Same boot: keep appending here unless it is full. The record
-             * count trusts the file size until tail recovery (step 4)
-             * checks the records. */
-            uint64_t n = (uint64_t)(sb.st_size - (off_t)sizeof h) / sizeof(struct record);
-            if (n < STORE_SEG_MAX) {
-                st->fd = fd;
-                fd = -1;
-                st->counter = max_live;
-                st->records = n;
-                st->size = sb.st_size;
-                goto done;
-            }
-            log_msg("%s is full (%" PRIu64 " records); starting the next segment", name, n);
-        } else {
-            /* Another boot: that segment stays sealed as it is. */
-            info->new_boot = 1;
-        }
-        if (close(fd) < 0) {
-            fd = -1;
-            fail(0, "close", name);
-            goto out;
-        }
-        fd = -1;
+        if (reuse)
+            goto done;
     }
 
     rc = next_counter(st, &next);
@@ -532,8 +666,6 @@ done:
 
 out:
     e = errno;
-    if (fd >= 0 && close(fd) < 0)
-        fail(0, "close", name);
     release(st);
     errno = e;
     return rc;

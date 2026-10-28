@@ -427,8 +427,29 @@ static void refuse_case(const void *bytes, size_t len, int expect)
     teardown();
 }
 
-/* H7: wrong version or sensor is refused untouched. The EBADHDR cases are
- * step 2 behaviour; step 4 turns them into quarantine. */
+/* Write bytes as segment 1, open, and expect it quarantined: open succeeds,
+ * the original bytes survive unchanged as .corrupt-1, segment 2 starts. */
+static void quarantine_case(const void *bytes, size_t len)
+{
+    struct store *st = NULL;
+    struct store_open_info info = { 0 };
+    struct snap s;
+
+    setup();
+    write_file("bme280.000001.mwlog", bytes, len);
+    take_snap("bme280.000001.mwlog", &s);
+    CHECK(store_open(g_dir, SENSOR_BME280, &st, &info) == STORE_OK);
+    CHECK(info.quarantined == 1 && info.quarantined_counter == 1 && info.bad_offset == 0);
+    CHECK(info.counter == 2 && info.created == 1);
+    CHECK(!exists("bme280.000001.mwlog"));
+    CHECK(unchanged("bme280.000001.mwlog.corrupt-1", &s));
+    CHECK(store_close(st) == STORE_OK);
+    teardown();
+}
+
+/* H7: another format version or sensor is refused untouched. A bad header
+ * (CRC, magic, counter, too short) is corruption and is quarantined; until
+ * step 4 these four cases were refusals. */
 static void test_refuse(void)
 {
     struct store_header h;
@@ -443,18 +464,18 @@ static void test_refuse(void)
 
     make_header(&h, SENSOR_BME280, 1, g_boot);
     h.crc32 ^= 1;
-    refuse_case(&h, sizeof h, STORE_EBADHDR);
+    quarantine_case(&h, sizeof h);
 
     make_header(&h, SENSOR_BME280, 1, g_boot);
     h.magic ^= 1;
     reseal(&h);
-    refuse_case(&h, sizeof h, STORE_EBADHDR);
+    quarantine_case(&h, sizeof h);
 
     make_header(&h, SENSOR_BME280, 2, g_boot); /* file name says 1 */
-    refuse_case(&h, sizeof h, STORE_EBADHDR);
+    quarantine_case(&h, sizeof h);
 
     make_header(&h, SENSOR_BME280, 1, g_boot);
-    refuse_case(&h, 10, STORE_EBADHDR); /* shorter than a header */
+    quarantine_case(&h, 10); /* shorter than a header */
 }
 
 /* H8: one writer per sensor; the lock goes away with the handle. */

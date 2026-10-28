@@ -100,3 +100,17 @@ memcheck-store: $(BUILD)/test_store_crc $(BUILD)/test_store_header $(BUILD)/test
 	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/test_store_header
 	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/test_store_bootid
 	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/test_store_append
+
+.PHONY: test-store-recovery memcheck-store-recovery
+
+$(BUILD)/test_store_recovery: tests/test_store_recovery.c $(STORE_LIB) $(STORE_HDR) src/capture/log.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc/store -Isrc/capture $(CFLAGS) -o $@ tests/test_store_recovery.c $(STORE_LIB)
+
+test: test-store-recovery
+test-store-recovery: $(BUILD)/test_store_recovery
+	./$(BUILD)/test_store_recovery
+
+memcheck: memcheck-store-recovery
+memcheck-store-recovery: $(BUILD)/test_store_recovery
+	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/test_store_recovery

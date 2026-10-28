@@ -38,7 +38,7 @@ enum store_status {
     STORE_EBADHDR  = -2, /* bad magic, CRC, record_size or counter, or too short */
     STORE_EVERSION = -3, /* another format version: refused, left untouched */
     STORE_ESENSOR  = -4, /* header is for the other sensor: refused, untouched */
-    /* -5 is reserved for STORE_ECORRUPT (recovery). */
+    STORE_ECORRUPT = -5, /* a record fails magic, sensor or CRC */
     STORE_EBUSY    = -6, /* another process holds <sensor>.lock */
     STORE_EINVAL   = -7, /* bad argument, or a record append refused */
 };
@@ -48,7 +48,18 @@ struct store_open_info {
     int      created;  /* 1 = this open created that segment */
     int      new_boot; /* 1 = the latest segment belonged to another boot */
     uint64_t records;  /* records already in that segment */
+
+    /* What recovery did to the latest segment found on disk. */
+    uint64_t truncated_bytes;     /* torn tail removed (0..63 bytes) */
+    int      quarantined;         /* 1 = renamed <seg>.corrupt-<n>, bytes kept */
+    uint32_t quarantined_counter; /* which segment was quarantined */
+    uint64_t bad_offset;          /* first bad byte that caused it; 0 = header */
+    uint32_t last_seq;            /* last valid record seen there; 0 if none */
+    int64_t  last_t_ns;
 };
+
+/* A stored record is valid when magic, sensor and crc32 all check out. */
+int store_record_check(const struct record *r, enum sensor_id sensor);
 
 /* Check a segment header read from the file for counter. Version is judged
  * before the CRC, so a newer format is refused rather than called corrupt. */
@@ -58,10 +69,16 @@ struct store;
 
 /* Open the log for one sensor in dir, which must already exist.
  * Takes <sensor>.lock for the life of the handle, removes this sensor's stale
- * .tmp files, then picks the segment: the latest one if it was written in this
- * boot and holds fewer than STORE_SEG_MAX records, otherwise a new one
- * numbered 1 + the highest counter seen, live or quarantined. On error *out
- * is NULL and no existing segment was changed. info may be NULL. */
+ * .tmp files, and recovers the latest segment:
+ *   - a partial record, or one bad *last* record, is a torn final write:
+ *     it is truncated away;
+ *   - a bad header, or a bad record before the last, is corruption: the
+ *     segment is renamed <seg>.corrupt-<n> with every byte kept;
+ *   - another format version or sensor is refused (error, untouched).
+ * Then it picks the segment: the latest one if it was written in this boot
+ * and holds fewer than STORE_SEG_MAX records, otherwise a new one numbered
+ * 1 + the highest counter seen, live or quarantined. On error *out is NULL.
+ * info may be NULL. */
 int store_open(const char *dir, enum sensor_id sensor, struct store **out,
                struct store_open_info *info);
 
