@@ -98,4 +98,44 @@ uint32_t store_counter(const struct store *st);
 /* Close every fd and free. NULL is fine. STORE_EIO if a close failed. */
 int store_close(struct store *st);
 
+/* ---- Reader: for analysis. Read-only; takes no lock; never truncates or
+ * renames, so it can run while the writer appends.
+ *
+ * Opening snapshots the sensor's file list and walks it in order: counter
+ * ascending, and for one counter the live file, then .corrupt-1, .corrupt-2...
+ *   Live or sealed segment: a bad header skips it; a partial or bad *last*
+ *     record is a write in progress (or a torn one) and just ends it; a bad
+ *     record before the last stops that segment, is counted, and the walk
+ *     moves on. There is no resync past a bad record.
+ *   Quarantined file: with a valid header, its records up to the first bad or
+ *     partial one are returned (salvaged), then the walk moves on; with a bad
+ *     header nothing is salvaged. */
+struct store_reader;
+
+struct store_rec_src {
+    uint32_t counter;     /* segment the record came from */
+    uint8_t  boot_id[16]; /* that segment's boot */
+    int      quarantined; /* 1 = salvaged from a .corrupt-<n> file */
+};
+
+struct store_reader_stats {
+    uint32_t segments;          /* live or sealed files opened */
+    uint32_t quarantined_files; /* .corrupt-<n> files opened */
+    uint32_t bad_header;        /* files of either kind skipped for their header */
+    uint32_t corrupt_stops;     /* live or sealed segments cut short mid-file */
+    uint32_t vanished;          /* listed at open, gone when reached (renamed) */
+    uint64_t salvaged_records;  /* records returned from .corrupt-<n> files */
+};
+
+int store_reader_open(const char *dir, enum sensor_id sensor, struct store_reader **out);
+
+/* 1 = *out holds the next record (src may be NULL), 0 = end, STORE_EIO = a
+ * read failed (logged); after an error every call returns STORE_EIO. */
+int store_reader_next(struct store_reader *rd, struct record *out, struct store_rec_src *src);
+
+void store_reader_stats(const struct store_reader *rd, struct store_reader_stats *out);
+
+/* Close and free. NULL is fine. STORE_EIO if a close failed. */
+int store_reader_close(struct store_reader *rd);
+
 #endif

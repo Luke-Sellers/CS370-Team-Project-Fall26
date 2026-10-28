@@ -114,3 +114,17 @@ test-store-recovery: $(BUILD)/test_store_recovery
 memcheck: memcheck-store-recovery
 memcheck-store-recovery: $(BUILD)/test_store_recovery
 	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/test_store_recovery
+
+.PHONY: test-store-reader memcheck-store-reader
+
+$(BUILD)/test_store_reader: tests/test_store_reader.c $(STORE_LIB) $(STORE_HDR) src/capture/log.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc/store -Isrc/capture $(CFLAGS) -o $@ tests/test_store_reader.c $(STORE_LIB)
+
+test: test-store-reader
+test-store-reader: $(BUILD)/test_store_reader
+	./$(BUILD)/test_store_reader
+
+memcheck: memcheck-store-reader
+memcheck-store-reader: $(BUILD)/test_store_reader
+	valgrind --error-exitcode=1 --leak-check=full -q ./$(BUILD)/test_store_reader

@@ -88,20 +88,32 @@ static int seg_name(char *buf, size_t n, enum sensor_id s, uint32_t counter, con
     return 0;
 }
 
-static int all_digits(const char *p)
+/* A whole string of digits that fits in 32 bits. */
+static int parse_u32(const char *p, uint32_t *out)
 {
+    unsigned long long v = 0;
+
     if (*p == '\0')
         return 0;
-    for (; *p != '\0'; p++)
+    for (; *p != '\0'; p++) {
         if (*p < '0' || *p > '9')
             return 0;
+        v = v * 10 + (unsigned long long)(*p - '0');
+        if (v > UINT32_MAX)
+            return 0;
+    }
+    *out = (uint32_t)v;
     return 1;
 }
 
 /* Classify "<sensor>.<counter>.mwlog[.tmp|.corrupt-<n>]". The counter must be
- * in canonical %06u form, so "bme280.1.mwlog" is not segment 1. */
-static enum name_kind parse_name(const char *name, const char *sensor, uint32_t *counter)
+ * in canonical %06u form, so "bme280.1.mwlog" is not segment 1. For a
+ * quarantined name, *qnum (if not NULL) gets n. */
+static enum name_kind parse_name(const char *name, const char *sensor, uint32_t *counter,
+                                 uint32_t *qnum)
 {
+    uint32_t q;
+
     size_t sl = strlen(sensor);
     const char *p, *end;
     unsigned long long v = 0;
@@ -129,8 +141,11 @@ static enum name_kind parse_name(const char *name, const char *sensor, uint32_t 
         return NAME_LIVE;
     if (strcmp(end, ".tmp") == 0)
         return NAME_TMP;
-    if (strncmp(end, ".corrupt-", 9) == 0 && all_digits(end + 9))
+    if (strncmp(end, ".corrupt-", 9) == 0 && parse_u32(end + 9, &q)) {
+        if (qnum != NULL)
+            *qnum = q;
         return NAME_CORRUPT;
+    }
     return NAME_OTHER;
 }
 
@@ -302,7 +317,7 @@ static int scan_dir(struct store *st, uint32_t *max_live, int *have_live)
                 rc = fail(STORE_EIO, "readdir", "segment dir");
             break;
         }
-        switch (parse_name(e->d_name, sname, &c)) {
+        switch (parse_name(e->d_name, sname, &c, NULL)) {
         case NAME_LIVE:
             if (!*have_live || c > *max_live)
                 *max_live = c;
@@ -762,4 +777,290 @@ uint32_t store_counter(const struct store *st)
 int store_close(struct store *st)
 {
     return release(st);
+}
+
+/* ---- Reader ---- */
+
+#define READ_CHUNK 128 /* records per pread: 4 KiB */
+
+struct seg_entry {
+    uint32_t counter;
+    uint32_t qnum; /* 0 = live/sealed file, n = .corrupt-<n> */
+};
+
+struct store_reader {
+    int dirfd;
+    enum sensor_id sensor;
+    struct seg_entry *list; /* snapshot taken at open, in walk order */
+    size_t count, next_file;
+    int fd;                 /* current file, -1 between files */
+    char name[NAME_LEN + 32];
+    struct store_rec_src src;
+    uint64_t n, idx;        /* whole records in the current file; next to read */
+    struct record buf[READ_CHUNK];
+    size_t buf_len, buf_pos;
+    int failed;
+    struct store_reader_stats stats;
+};
+
+static int seg_entry_cmp(const void *a, const void *b)
+{
+    const struct seg_entry *x = a, *y = b;
+
+    if (x->counter != y->counter)
+        return x->counter < y->counter ? -1 : 1;
+    if (x->qnum != y->qnum)
+        return x->qnum < y->qnum ? -1 : 1;
+    return 0;
+}
+
+/* Snapshot this sensor's live and quarantined files, sorted for the walk. */
+static int list_segments(struct store_reader *rd)
+{
+    const char *sname = sensor_name(rd->sensor);
+    size_t cap = 0;
+    struct dirent *e;
+    DIR *d;
+    int fd, rc = STORE_OK;
+
+    fd = openat(rd->dirfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return fail(STORE_EIO, "open", "segment dir");
+    d = fdopendir(fd);
+    if (d == NULL) {
+        fail(0, "fdopendir", "segment dir");
+        if (close(fd) < 0)
+            fail(0, "close", "segment dir");
+        return STORE_EIO;
+    }
+    for (;;) {
+        struct seg_entry s = { 0, 0 };
+        enum name_kind kind;
+
+        errno = 0;
+        e = readdir(d);
+        if (e == NULL) {
+            if (errno != 0)
+                rc = fail(STORE_EIO, "readdir", "segment dir");
+            break;
+        }
+        kind = parse_name(e->d_name, sname, &s.counter, &s.qnum);
+        if (kind != NAME_LIVE && kind != NAME_CORRUPT)
+            continue;
+        if (kind == NAME_LIVE)
+            s.qnum = 0;
+        else if (s.qnum == 0)
+            continue; /* ".corrupt-0" is never written; not ours */
+        if (rd->count == cap) {
+            size_t ncap = cap ? cap * 2 : 32;
+            struct seg_entry *grown = realloc(rd->list, ncap * sizeof *grown);
+            if (grown == NULL) {
+                rc = fail(STORE_EIO, "realloc for", "segment list");
+                break;
+            }
+            rd->list = grown;
+            cap = ncap;
+        }
+        rd->list[rd->count++] = s;
+    }
+    if (closedir(d) < 0)
+        rc = fail(STORE_EIO, "closedir", "segment dir");
+    if (rc == STORE_OK && rd->count > 1)
+        qsort(rd->list, rd->count, sizeof rd->list[0], seg_entry_cmp);
+    return rc;
+}
+
+static void reader_close_file(struct store_reader *rd)
+{
+    if (rd->fd >= 0 && close(rd->fd) < 0)
+        fail(0, "close", rd->name);
+    rd->fd = -1;
+}
+
+/* Open the next listed file and check its header. STORE_OK with rd->fd set
+ * means records follow; STORE_OK with rd->fd == -1 means the file was
+ * skipped (gone, or a bad header); STORE_EIO is a real I/O failure. */
+static int reader_open_next(struct store_reader *rd)
+{
+    const struct seg_entry *s = &rd->list[rd->next_file++];
+    struct store_header h;
+    struct stat sb;
+    int rc;
+
+    if (seg_name(rd->name, sizeof rd->name, rd->sensor, s->counter, "") < 0)
+        return fail(STORE_EIO, "name", sensor_name(rd->sensor));
+    if (s->qnum != 0) {
+        size_t l = strlen(rd->name);
+        snprintf(rd->name + l, sizeof rd->name - l, ".corrupt-%" PRIu32, s->qnum);
+    }
+
+    rd->fd = openat(rd->dirfd, rd->name, O_RDONLY | O_CLOEXEC);
+    if (rd->fd < 0) {
+        if (errno == ENOENT) {
+            /* Renamed since the snapshot, e.g. quarantined by the writer. */
+            rd->stats.vanished++;
+            log_msg("reader: %s is gone since the listing; skipped", rd->name);
+            return STORE_OK;
+        }
+        return fail(STORE_EIO, "open", rd->name);
+    }
+    if (s->qnum != 0)
+        rd->stats.quarantined_files++;
+    else
+        rd->stats.segments++;
+
+    if (fstat(rd->fd, &sb) < 0) {
+        fail(0, "fstat", rd->name);
+        reader_close_file(rd);
+        return STORE_EIO;
+    }
+    if (sb.st_size < (off_t)sizeof h) {
+        rd->stats.bad_header++;
+        log_msg("reader: skipping %s: shorter than a header", rd->name);
+        reader_close_file(rd);
+        return STORE_OK;
+    }
+    if (pread_all(rd->fd, &h, sizeof h, 0) < 0) {
+        fail(0, "read header", rd->name);
+        reader_close_file(rd);
+        return STORE_EIO;
+    }
+    rc = store_header_check(&h, rd->sensor, s->counter);
+    if (rc != STORE_OK) {
+        rd->stats.bad_header++;
+        log_msg("reader: skipping %s: %s", rd->name, status_text(rc));
+        reader_close_file(rd);
+        return STORE_OK;
+    }
+
+    /* Whole records as of now; a write still in flight is left for next time. */
+    rd->n = (uint64_t)(sb.st_size - (off_t)sizeof h) / sizeof(struct record);
+    rd->idx = 0;
+    rd->buf_len = rd->buf_pos = 0;
+    rd->src.counter = s->counter;
+    memcpy(rd->src.boot_id, h.boot_id, sizeof rd->src.boot_id);
+    rd->src.quarantined = (s->qnum != 0);
+    return STORE_OK;
+}
+
+int store_reader_open(const char *dir, enum sensor_id sensor, struct store_reader **out)
+{
+    struct store_reader *rd;
+    int rc, e;
+
+    if (out != NULL)
+        *out = NULL;
+    if (dir == NULL || out == NULL || sensor_name(sensor) == NULL) {
+        errno = EINVAL;
+        return STORE_EINVAL;
+    }
+    rd = calloc(1, sizeof *rd);
+    if (rd == NULL)
+        return fail(STORE_EIO, "calloc for", "reader");
+    rd->fd = -1;
+    rd->sensor = sensor;
+    rd->dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rd->dirfd < 0) {
+        rc = fail(STORE_EIO, "open dir", dir);
+        goto out;
+    }
+    rc = list_segments(rd);
+    if (rc != STORE_OK)
+        goto out;
+    *out = rd;
+    return STORE_OK;
+
+out:
+    e = errno;
+    store_reader_close(rd);
+    errno = e;
+    return rc;
+}
+
+int store_reader_next(struct store_reader *rd, struct record *out, struct store_rec_src *src)
+{
+    if (rd == NULL || out == NULL) {
+        errno = EINVAL;
+        return STORE_EINVAL;
+    }
+    for (;;) {
+        struct record r;
+
+        if (rd->failed) {
+            errno = EIO;
+            return STORE_EIO;
+        }
+        if (rd->fd < 0) {
+            if (rd->next_file >= rd->count)
+                return 0;
+            if (reader_open_next(rd) != STORE_OK) {
+                rd->failed = 1;
+                return STORE_EIO;
+            }
+            continue;
+        }
+        if (rd->idx >= rd->n) {
+            reader_close_file(rd);
+            continue;
+        }
+        if (rd->buf_pos == rd->buf_len) {
+            uint64_t left = rd->n - rd->idx;
+            size_t k = left < READ_CHUNK ? (size_t)left : READ_CHUNK;
+            off_t off = (off_t)(sizeof(struct store_header) + rd->idx * sizeof(struct record));
+            if (pread_all(rd->fd, rd->buf, k * sizeof rd->buf[0], off) < 0) {
+                fail(0, "read records", rd->name);
+                reader_close_file(rd);
+                rd->failed = 1;
+                return STORE_EIO;
+            }
+            rd->buf_len = k;
+            rd->buf_pos = 0;
+        }
+
+        r = rd->buf[rd->buf_pos];
+        if (store_record_check(&r, rd->sensor) != STORE_OK) {
+            /* No resync: whatever follows a bad record in this file is not
+             * returned. A bad last record of a live or sealed segment is a
+             * write in flight or a torn one, not corruption. */
+            if (!rd->src.quarantined && rd->idx != rd->n - 1) {
+                rd->stats.corrupt_stops++;
+                log_msg("reader: %s: bad record at offset %" PRIu64 "; rest of segment skipped",
+                        rd->name,
+                        (uint64_t)(sizeof(struct store_header) + rd->idx * sizeof(struct record)));
+            }
+            reader_close_file(rd);
+            continue;
+        }
+        rd->buf_pos++;
+        rd->idx++;
+        if (rd->src.quarantined)
+            rd->stats.salvaged_records++;
+        *out = r;
+        if (src != NULL)
+            *src = rd->src;
+        return 1;
+    }
+}
+
+void store_reader_stats(const struct store_reader *rd, struct store_reader_stats *out)
+{
+    if (rd == NULL)
+        memset(out, 0, sizeof *out);
+    else
+        *out = rd->stats;
+}
+
+int store_reader_close(struct store_reader *rd)
+{
+    int rc = STORE_OK;
+
+    if (rd == NULL)
+        return STORE_OK;
+    if (rd->fd >= 0 && close(rd->fd) < 0)
+        rc = fail(STORE_EIO, "close", rd->name);
+    if (rd->dirfd >= 0 && close(rd->dirfd) < 0)
+        rc = fail(STORE_EIO, "close", "segment dir");
+    free(rd->list);
+    free(rd);
+    return rc;
 }
